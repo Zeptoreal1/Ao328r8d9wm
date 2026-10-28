@@ -3,11 +3,11 @@
 	"gd": {
 		"android": "2.2081"
 	},
-	"version": "v2.1.0",
+	"version": "v2.1.1",
 	"id": "ai.predictivebuffer",
 	"name": "Predictive Input Buffer",
 	"developer": "lilWC",
-	"description": "Per-gamemode press/release input buffer with spam guard, overlay, per-level profiles, hotkeys and practice tools.",
+	"description": "Ground-mode press buffer plus wave release buffer, spam guard, overlay, per-level profiles and practice tools (noclip, speed, freeze, step, checkpoint).",
 	"settings": {
 		"enabled": {
 			"name": "Enabled",
@@ -16,8 +16,8 @@
 			"default": true
 		},
 		"normal-ticks": {
-			"name": "Default ticks (fallback)",
-			"description": "Fallback max delay (ticks) used when a per-gamemode value is -1. 4 ticks = 1 frame at 60 fps.",
+			"name": "Default ticks (cube, ball, robot, spider)",
+			"description": "Default max press buffer in ticks. 4 ticks = 1 frame at 60 fps.",
 			"type": "int",
 			"default": 2,
 			"min": 0,
@@ -29,28 +29,6 @@
 		"cube-ticks": {
 			"name": "Cube press ticks",
 			"description": "Max press buffer for Cube. -1 = use default ticks.",
-			"type": "int",
-			"default": -1,
-			"min": -1,
-			"max": 40,
-			"control": {
-				"slider": true
-			}
-		},
-		"ship-ticks": {
-			"name": "Ship press ticks",
-			"description": "Max press buffer for Ship. -1 = use default ticks.",
-			"type": "int",
-			"default": -1,
-			"min": -1,
-			"max": 40,
-			"control": {
-				"slider": true
-			}
-		},
-		"ufo-ticks": {
-			"name": "UFO press ticks",
-			"description": "Max press buffer for UFO. -1 = use default ticks.",
 			"type": "int",
 			"default": -1,
 			"min": -1,
@@ -92,28 +70,6 @@
 				"slider": true
 			}
 		},
-		"swing-ticks": {
-			"name": "Swing press ticks",
-			"description": "Max press buffer for Swing. -1 = use default ticks.",
-			"type": "int",
-			"default": -1,
-			"min": -1,
-			"max": 40,
-			"control": {
-				"slider": true
-			}
-		},
-		"wave-ticks": {
-			"name": "Wave press ticks",
-			"description": "Max press delay (ticks) while in wave.",
-			"type": "int",
-			"default": 2,
-			"min": 0,
-			"max": 40,
-			"control": {
-				"slider": true
-			}
-		},
 		"release-ticks": {
 			"name": "Release ticks (all modes)",
 			"description": "Delay buffer for button RELEASES in non-wave modes. 0 = off.",
@@ -127,7 +83,7 @@
 		},
 		"wave-release-ticks": {
 			"name": "Wave release ticks",
-			"description": "Max release delay (ticks) while in wave.",
+			"description": "Max delay (ticks) before a wave RELEASE is applied. Saved level profiles override this.",
 			"type": "int",
 			"default": 2,
 			"min": 0,
@@ -149,47 +105,6 @@
 			"default": 20,
 			"min": 4,
 			"max": 60,
-			"control": {
-				"slider": true
-			}
-		},
-		"background-image": {
-			"name": "Menu background image",
-			"description": "Pick a PNG or JPG to use as the background of the Buffer menu. Leave empty for the default look. Tip: use images up to about 1024x1024 so the game does not run out of memory.",
-			"type": "file",
-			"default": "",
-			"control": {
-				"dialog": "open",
-				"filters": [
-					{
-						"description": "Images",
-						"files": [
-							"*.png",
-							"*.jpg",
-							"*.jpeg"
-						]
-					}
-				]
-			}
-		},
-		"background-opacity": {
-			"name": "Background opacity (%)",
-			"description": "How visible the custom background is.",
-			"type": "int",
-			"default": 100,
-			"min": 10,
-			"max": 100,
-			"control": {
-				"slider": true
-			}
-		},
-		"background-dim": {
-			"name": "Background darkening (%)",
-			"description": "Darkens the custom background so the buttons and text are easier to read.",
-			"type": "int",
-			"default": 30,
-			"min": 0,
-			"max": 90,
 			"control": {
 				"slider": true
 			}
@@ -230,17 +145,6 @@
 			"default": 1.0,
 			"min": 0.1,
 			"max": 2.0,
-			"control": {
-				"slider": true
-			}
-		},
-		"auto-close": {
-			"name": "Menu auto-close (seconds)",
-			"description": "Seconds without touching the menu before it closes by itself. 0 = never.",
-			"type": "int",
-			"default": 15,
-			"min": 0,
-			"max": 120,
 			"control": {
 				"slider": true
 			}
