@@ -3,11 +3,11 @@
 	"gd": {
 		"android": "2.2081"
 	},
-	"version": "v2.1.1",
+	"version": "v3.0.0",
 	"id": "ai.predictivebuffer",
 	"name": "Predictive Input Buffer",
 	"developer": "lilWC",
-	"description": "Ground-mode press buffer plus wave release buffer, spam guard, overlay, per-level profiles and practice tools (noclip, speed, freeze, step, checkpoint).",
+	"description": "Predictive input buffer: simulates your click ahead and holds it only if it would hit a hazard. Settings GUI on the pause menu, spam guard, overlay, practice tools.",
 	"settings": {
 		"enabled": {
 			"name": "Enabled",
@@ -15,9 +15,15 @@
 			"type": "bool",
 			"default": true
 		},
-		"normal-ticks": {
-			"name": "Default ticks (cube, ball, robot, spider)",
-			"description": "Default max press buffer in ticks. 4 ticks = 1 frame at 60 fps.",
+		"predictive": {
+			"name": "Predictive mode",
+			"description": "On: simulates your click a few ticks ahead and holds it only if it would hit a hazard. Off: classic delay buffer.",
+			"type": "bool",
+			"default": true
+		},
+		"ground-ticks": {
+			"name": "Ground ticks (cube, ball, robot, spider)",
+			"description": "Max ticks a click is held while waiting to land / for a safe moment. 4 ticks = 1 frame at 60 fps.",
 			"type": "int",
 			"default": 2,
 			"min": 0,
@@ -26,55 +32,11 @@
 				"slider": true
 			}
 		},
-		"cube-ticks": {
-			"name": "Cube press ticks",
-			"description": "Max press buffer for Cube. -1 = use default ticks.",
+		"flight-ticks": {
+			"name": "Flight ticks (ship, UFO, swing, wave)",
+			"description": "Max ticks a click may be held back in flying modes. Only used in Predictive mode, and only when the click would hit a hazard.",
 			"type": "int",
-			"default": -1,
-			"min": -1,
-			"max": 40,
-			"control": {
-				"slider": true
-			}
-		},
-		"ball-ticks": {
-			"name": "Ball press ticks",
-			"description": "Max press buffer for Ball. -1 = use default ticks.",
-			"type": "int",
-			"default": -1,
-			"min": -1,
-			"max": 40,
-			"control": {
-				"slider": true
-			}
-		},
-		"robot-ticks": {
-			"name": "Robot press ticks",
-			"description": "Max press buffer for Robot. -1 = use default ticks.",
-			"type": "int",
-			"default": -1,
-			"min": -1,
-			"max": 40,
-			"control": {
-				"slider": true
-			}
-		},
-		"spider-ticks": {
-			"name": "Spider press ticks",
-			"description": "Max press buffer for Spider. -1 = use default ticks.",
-			"type": "int",
-			"default": -1,
-			"min": -1,
-			"max": 40,
-			"control": {
-				"slider": true
-			}
-		},
-		"release-ticks": {
-			"name": "Release ticks (all modes)",
-			"description": "Delay buffer for button RELEASES in non-wave modes. 0 = off.",
-			"type": "int",
-			"default": 0,
+			"default": 2,
 			"min": 0,
 			"max": 40,
 			"control": {
@@ -83,7 +45,7 @@
 		},
 		"wave-release-ticks": {
 			"name": "Wave release ticks",
-			"description": "Max delay (ticks) before a wave RELEASE is applied. Saved level profiles override this.",
+			"description": "Max ticks a wave release may be held (predictive: only if releasing now would hit a hazard; classic: always).",
 			"type": "int",
 			"default": 2,
 			"min": 0,
@@ -92,9 +54,31 @@
 				"slider": true
 			}
 		},
+		"release-ticks": {
+			"name": "Release ticks (other modes)",
+			"description": "Max ticks other-mode releases may be held. 0 = off.",
+			"type": "int",
+			"default": 0,
+			"min": 0,
+			"max": 40,
+			"control": {
+				"slider": true
+			}
+		},
+		"lookahead": {
+			"name": "Lookahead (ticks)",
+			"description": "How far ahead the predictor simulates. Higher = safer predictions, more CPU.",
+			"type": "int",
+			"default": 24,
+			"min": 4,
+			"max": 60,
+			"control": {
+				"slider": true
+			}
+		},
 		"spam-guard": {
 			"name": "Spam guard",
-			"description": "When you click fast (3+ clicks closer than the spam interval) the buffer lets inputs through untouched. Also protects FPS.",
+			"description": "When you click fast (3+ clicks closer than the spam interval) the buffer lets inputs through untouched.",
 			"type": "bool",
 			"default": true
 		},
@@ -111,7 +95,7 @@
 		},
 		"overlay": {
 			"name": "Input overlay",
-			"description": "Shows the last buffered input and its delay on screen while playing.",
+			"description": "Shows buffered inputs and their delay on screen.",
 			"type": "bool",
 			"default": true
 		},
@@ -128,19 +112,19 @@
 		},
 		"practice-buttons": {
 			"name": "Practice buttons",
-			"description": "Shows on-screen buttons in Practice Mode: Buffer on/off, Freeze, Step one frame, Checkpoint.",
+			"description": "On-screen Buf / Freeze / Step / Checkpoint buttons, shown only in Practice Mode and hidden while paused.",
 			"type": "bool",
 			"default": true
 		},
 		"noclip": {
 			"name": "Noclip (practice mode only)",
-			"description": "You do not die from obstacles. Only works while playing in Practice Mode, so it never affects normal runs.",
+			"description": "You do not die from obstacles. Only works in Practice Mode.",
 			"type": "bool",
 			"default": false
 		},
 		"game-speed": {
 			"name": "Game speed (practice mode only)",
-			"description": "Speed of the game, from 0.10x (slow motion) to 2.00x. Only applies in Practice Mode.",
+			"description": "0.10x to 2.00x. Only applies in Practice Mode.",
 			"type": "float",
 			"default": 1.0,
 			"min": 0.1,
@@ -149,25 +133,13 @@
 				"slider": true
 			}
 		},
-		"button-corner": {
-			"name": "Pause button corner",
-			"description": "Where the Buffer button appears in the pause menu.",
-			"type": "string",
-			"default": "Abajo der.",
-			"one-of": [
-				"Abajo der.",
-				"Abajo izq.",
-				"Arriba der.",
-				"Arriba izq."
-			]
-		},
 		"button-scale": {
 			"name": "Pause button size",
-			"description": "Size of the Buffer button in the pause menu.",
+			"description": "Size of the Buffer button on the pause screen (right-middle).",
 			"type": "float",
-			"default": 0.7,
-			"min": 0.4,
-			"max": 1.2,
+			"default": 1.0,
+			"min": 0.6,
+			"max": 1.6,
 			"control": {
 				"slider": true
 			}
