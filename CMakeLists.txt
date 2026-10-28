@@ -6,7 +6,7 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
 project(PredictiveBuffer VERSION 2.1.0)
 
-file(GLOB SOURCES src/*.cpp)
+file(GLOB SOURCES *.cpp)
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
 
 if (NOT DEFINED ENV{GEODE_SDK})
