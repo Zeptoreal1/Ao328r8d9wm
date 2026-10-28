@@ -1,4 +1,4 @@
-// Predictive Input Buffer v2.1.0 — mobile-friendly rewrite.
+// Predictive Input Buffer v2.1.1 — mobile-friendly rewrite.
 // NOTE: written without access to a compiler/Geode SDK; see README for build + fixes.
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -36,27 +36,27 @@ namespace {
         return sscanf(v.c_str(), "%d,%d", &normalT, &waveT) == 2;
     }
 
+    // Only ground-based modes need a press buffer. Ship, UFO, wave and swing can act any
+    // time, so delaying their presses would only add lag (wave uses the release buffer).
     int pressTicksFor(PlayerObject* p, PlayLayer* pl) {
         int normal = (int)S<int64_t>("normal-ticks");
-        int wave = (int)S<int64_t>("wave-ticks");
         int pn, pw;
-        if (pl && loadProfile(pl, pn, pw)) { normal = pn; wave = pw; }
-        if (p->m_isDart) return wave;
+        if (pl && loadProfile(pl, pn, pw)) normal = pn;
+        if (p->m_isDart || p->m_isShip || p->m_isBird || p->m_isSwing) return 0;
         char const* k = "cube-ticks";
-        if (p->m_isShip) k = "ship-ticks";
-        else if (p->m_isBird) k = "ufo-ticks";
-        else if (p->m_isBall) k = "ball-ticks";
+        if (p->m_isBall) k = "ball-ticks";
         else if (p->m_isRobot) k = "robot-ticks";
         else if (p->m_isSpider) k = "spider-ticks";
-        else if (p->m_isSwing) k = "swing-ticks";
         int v = (int)S<int64_t>(k);
         return v < 0 ? normal : v;
     }
 
     int releaseTicksFor(PlayerObject* p, PlayLayer* pl) {
         if (p->m_isDart) {
-            int wave = (int)S<int64_t>("wave-release-ticks");
-            return wave;
+            int w = (int)S<int64_t>("wave-release-ticks");
+            int pn, pw;
+            if (pl && loadProfile(pl, pn, pw)) w = pw;
+            return w;
         }
         return (int)S<int64_t>("release-ticks");
     }
@@ -88,6 +88,15 @@ class $modify(BufGJBase, GJBaseGameLayer) {
         if (!player) { GJBaseGameLayer::handleButton(down, button, isPlayer1); return; }
 
         if (down) {
+            // a new press must not be cancelled by an older delayed release: flush those first
+            for (auto it = g_queue.begin(); it != g_queue.end();) {
+                if (!it->down && it->p1 == isPlayer1) {
+                    auto pr = *it; it = g_queue.erase(it);
+                    g_passthrough = true;
+                    GJBaseGameLayer::handleButton(false, pr.button, pr.p1);
+                    g_passthrough = false;
+                } else ++it;
+            }
             g_lastPress[0] = g_lastPress[1]; g_lastPress[1] = g_lastPress[2]; g_lastPress[2] = g_tick;
             int maxT = pressTicksFor(player, pl);
             // already able to act, buffer disabled for this mode, or spamming -> straight through
@@ -118,7 +127,7 @@ class $modify(BufGJBase, GJBaseGameLayer) {
         g_queue.push_back({false, button, isPlayer1, 0, rT});
     }
 
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         ++g_tick;
         auto pl = PlayLayer::get();
         if (pl && !g_queue.empty()) {
@@ -136,7 +145,7 @@ class $modify(BufGJBase, GJBaseGameLayer) {
                 } else ++it;
             }
         }
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 
@@ -245,20 +254,20 @@ class $modify(BufPause, PauseLayer) {
     void onBuffer(CCObject*) {
         auto pl = PlayLayer::get();
         if (!pl) return;
-        int n = (int)S<int64_t>("normal-ticks"), w = (int)S<int64_t>("wave-ticks");
+        int n = (int)S<int64_t>("normal-ticks"), w = (int)S<int64_t>("wave-release-ticks");
         int pn, pw;
         bool has = loadProfile(pl, pn, pw);
         auto msg = fmt::format(
             "Global: normal <cy>{}</c>t, wave <cy>{}</c>t.\nThis level profile: {}.\n\n"
             "<cg>Save</c> stores the global values for this level. <cr>Clear</c> removes it.\n"
             "(Change global values in the mod settings, then Save.)",
-            n, w, has ? fmt::format("normal {}t, wave {}t", pn, pw) : "none");
+            n, w, has ? fmt::format("normal {}t, wave-release {}t", pn, pw) : "none");
         createQuickPopup("Buffer", msg, "Clear", "Save",
             [pl](auto, bool save) {
                 auto key = profileKey(pl);
                 if (save) {
                     Mod::get()->setSavedValue<std::string>(key, fmt::format("{},{}",
-                        (int)S<int64_t>("normal-ticks"), (int)S<int64_t>("wave-ticks")));
+                        (int)S<int64_t>("normal-ticks"), (int)S<int64_t>("wave-release-ticks")));
                 } else {
                     Mod::get()->setSavedValue<std::string>(key, "");
                 }
