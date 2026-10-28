@@ -1,7 +1,6 @@
 // Predictive Input Buffer v3.0.0
-// - Predictive mode: simulates a click a few ticks ahead; if it would hit a hazard the click is
-//   held and registered on a later, safer tick (up to your tick limit).
-// - Normal mode: classic delay buffer (ground modes wait to land, wave release is delayed).
+// - Always predictive: a click is projected a few ticks ahead with a read-only math model; if it
+//   would hit a hazard the click is held and registered on a later, safer tick (up to your limit).
 // - In-game settings GUI opened from a big button on the pause menu.
 #include <Geode/Geode.hpp>
 #include <Geode/ui/Popup.hpp>
@@ -30,19 +29,14 @@ namespace {
     Ref<CCLabelBMFont> g_overlay;
     Ref<CCMenu> g_menu;
 
-    // ---- simulation state ----
-    float g_dt = 0.f;          // dt of the last processCommands call
-    float g_scale = 1.f;       // calibrated: sim dt = g_dt * g_scale == one real tick of movement
-    bool  g_simOK = false;     // prediction usable (calibration succeeded)
-    bool  g_useField = false;  // read m_position instead of node position
+    // ---- prediction state (read-only: observed from the real player, never modifies it) ----
+    float g_dx = 0.f;          // observed horizontal movement per tick
+    float g_slope = 1.f;       // observed wave slope (|dy|/dx)
     bool  g_havePrev = false;
-    float g_prevX = 0.f;
-    int   g_calibCount = 0;
-    int   g_sinceCalib = 0;
+    float g_prevX = 0.f, g_prevY = 0.f;
 
     template <class T> T S(char const* k) { return Mod::get()->getSettingValue<T>(k); }
 
-    CCPoint ppos(PlayerObject* p) { return g_useField ? p->m_position : p->getPosition(); }
 
     bool isGroundMode(PlayerObject* p) {
         return !(p->m_isDart || p->m_isShip || p->m_isBird || p->m_isSwing);
@@ -107,59 +101,37 @@ namespace {
         return false;
     }
 
-    PlayerCheckpoint* cpBuf() {
-        static Ref<PlayerCheckpoint> cp = PlayerCheckpoint::create();
-        return cp;
-    }
-
-    // Would registering this press/release RIGHT NOW get the player killed by a hazard
-    // within the lookahead window (assuming no further input)?
+    // Pure math model on copies of numbers. Never calls game physics, so it cannot corrupt state.
+    // Would registering this press/release RIGHT NOW lead into a hazard within ~24 ticks?
+    // Modelled: wave (press/release) and cube jumps. Other modes are not modelled (never held back).
     bool wouldDie(PlayLayer* pl, PlayerObject* p, bool pressNow) {
-        if (!g_simOK || !pl || !p || p->m_isDead) return false;
-        int look = (int)S<int64_t>("lookahead");
-        auto start = ppos(p);
-        auto hz = collectHazards(pl, start.x, 14.f * look + 80.f);
+        constexpr int look = 24;
+        if (!pl || !p || p->m_isDead || g_dx < 0.01f) return false;
+        auto start = p->getPosition();
+        auto hz = collectHazards(pl, start.x, g_dx * look + 80.f);
         if (hz.empty()) return false;
+        float flip = p->m_isUpsideDown ? -1.f : 1.f;
+        float x = start.x, y = start.y;
 
-        auto cp = cpBuf();
-        p->saveToCheckpoint(cp);
-        bool wasHold = p->m_holdingButtons[1];
-        if (pressNow) p->pushButton(PlayerButton::Jump); else p->releaseButton(PlayerButton::Jump);
-
-        bool dead = false;
-        float sdt = g_dt * g_scale;
-        for (int t = 0; t < look; ++t) {
-            p->update(sdt);
-            if (hitsHazard(ppos(p), hz)) { dead = true; break; }
-        }
-        p->loadFromCheckpoint(cp);
-        p->m_holdingButtons[1] = wasHold;
-        return dead;
-    }
-
-    // Measure how far one real tick moves the player vs. one sim step, so predicted
-    // trajectories use the right time step. If the sim can't move the player we disable prediction.
-    void calibrate(PlayerObject* p, float observedDx) {
-        auto cp = cpBuf();
-        for (int attempt = 0; attempt < 2; ++attempt) {
-            p->saveToCheckpoint(cp);
-            float x0 = ppos(p).x;
-            p->update(g_dt);
-            float d = ppos(p).x - x0;
-            p->loadFromCheckpoint(cp);
-            if (d > 0.0001f) {
-                float s = observedDx / d;
-                if (s > 0.02f && s < 50.f) {
-                    if (g_calibCount == 0) g_scale = s;
-                    else if (s < g_scale * 1.5f && s > g_scale / 1.5f) g_scale = g_scale * 0.7f + s * 0.3f;
-                    ++g_calibCount;
-                    g_simOK = true;
-                }
-                return;
+        if (p->m_isDart) {
+            float vy = (pressNow ? 1.f : -1.f) * flip * g_slope * g_dx;
+            for (int t = 0; t < look; ++t) {
+                x += g_dx; y += vy;
+                if (hitsHazard({x, y}, hz)) return true;
             }
-            if (attempt == 0) g_useField = !g_useField; // try the other position source
+            return false;
         }
-        g_simOK = false;
+        if (!pressNow || !isGroundMode(p) || p->m_isBall || p->m_isRobot || p->m_isSpider) return false;
+
+        // cube jump: 60 Hz-frame constants, scaled by frames-per-tick derived from observed speed
+        float ft = g_dx / (5.193f * std::max(p->m_playerSpeed, 0.1f));
+        float vy = 11.18f * flip, g = 0.958f * flip, groundY = start.y;
+        for (int t = 0; t < look; ++t) {
+            x += g_dx; y += vy * ft; vy -= g * ft;
+            if ((flip > 0 && y <= groundY) || (flip < 0 && y >= groundY)) { y = groundY; vy = 0.f; }
+            if (hitsHazard({x, y}, hz)) return true;
+        }
+        return false;
     }
 
     bool canFireNow(PlayLayer* pl, PlayerObject* p, Pending const& pd, bool predictive) {
@@ -181,7 +153,7 @@ class $modify(BufGJBase, GJBaseGameLayer) {
         }
         auto* player = isPlayer1 ? m_player1 : m_player2;
         if (!player) { GJBaseGameLayer::handleButton(down, button, isPlayer1); return; }
-        bool predictive = S<bool>("predictive") && g_simOK;
+        bool predictive = true;
 
         if (down) {
             // a new press must not be cancelled by an older delayed release: flush those first
@@ -219,21 +191,22 @@ class $modify(BufGJBase, GJBaseGameLayer) {
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         ++g_tick;
-        g_dt = dt;
         auto pl = PlayLayer::get();
         if (pl && m_player1 && !m_player1->m_isDead) {
-            float x = ppos(m_player1).x;
-            if (g_havePrev && x > g_prevX && g_queue.empty() && S<bool>("predictive")) {
-                if (g_calibCount < 6 || ++g_sinceCalib >= 240) {
-                    g_sinceCalib = 0;
-                    calibrate(m_player1, x - g_prevX);
+            auto pos = m_player1->getPosition();
+            if (g_havePrev && pos.x > g_prevX) {
+                float dx = pos.x - g_prevX;
+                g_dx = g_dx <= 0.f ? dx : g_dx * 0.8f + dx * 0.2f;
+                if (m_player1->m_isDart) {
+                    float sl = std::fabs(pos.y - g_prevY) / dx;
+                    if (sl > 0.3f && sl < 3.f) g_slope = sl;
                 }
             }
-            g_prevX = x; g_havePrev = true;
+            g_prevX = pos.x; g_prevY = pos.y; g_havePrev = true;
         }
 
         if (pl && !g_queue.empty()) {
-            bool predictive = S<bool>("predictive") && g_simOK;
+            bool predictive = true;
             for (auto it = g_queue.begin(); it != g_queue.end();) {
                 auto* player = it->p1 ? m_player1 : m_player2;
                 ++it->age;
@@ -258,7 +231,6 @@ namespace {
 
     constexpr TRow kToggles[] = {
         {"enabled", "Buffer enabled"},
-        {"predictive", "Predictive mode"},
         {"spam-guard", "Spam guard"},
         {"overlay", "Input overlay"},
         {"practice-buttons", "Practice buttons"},
@@ -269,7 +241,6 @@ namespace {
         {"flight-ticks", "Flight ticks", 0, 40, 1, false},
         {"wave-release-ticks", "Wave release", 0, 40, 1, false},
         {"release-ticks", "Release ticks", 0, 40, 1, false},
-        {"lookahead", "Lookahead", 4, 60, 2, false},
         {"game-speed", "Game speed", 0.1, 2.0, 0.1, true},
     };
 
@@ -330,7 +301,7 @@ protected:
             m_vals[r.key] = v;
         }
 
-        auto hint = CCLabelBMFont::create("Tick = 1/4 frame at 60 fps. Predictive holds a click only if it would hit a hazard.", "chatFont.fnt");
+        auto hint = CCLabelBMFont::create("Tick = 1/4 frame at 60 fps. Predictive is always on: a click is held only if it would hit a hazard.", "chatFont.fnt");
         hint->setScale(.5f);
         hint->setOpacity(160);
         hint->setPosition({195.f, 22.f});
@@ -461,7 +432,7 @@ class $modify(BufPlay, PlayLayer) {
         CCDirector::get()->getScheduler()->setTimeScale(1.f);
         g_lastScale = 1.f; g_freeze = false; g_step = false;
         g_queue.clear(); g_overlay = nullptr; g_menu = nullptr;
-        g_havePrev = false; g_simOK = false; g_calibCount = 0;
+        g_havePrev = false; g_dx = 0.f; g_slope = 1.f;
         PlayLayer::onQuit();
     }
 };
