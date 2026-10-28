@@ -1,11 +1,18 @@
-// Predictive Input Buffer v2.1.1 — mobile-friendly rewrite.
-// NOTE: written without access to a compiler/Geode SDK; see README for build + fixes.
+// Predictive Input Buffer v3.0.0
+// - Predictive mode: simulates a click a few ticks ahead; if it would hit a hazard the click is
+//   held and registered on a later, safer tick (up to your tick limit).
+// - Normal mode: classic delay buffer (ground modes wait to land, wave release is delayed).
+// - In-game settings GUI opened from a big button on the pause menu.
 #include <Geode/Geode.hpp>
+#include <Geode/ui/Popup.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <deque>
+#include <map>
 #include <algorithm>
+#include <vector>
+#include <cmath>
 
 using namespace geode::prelude;
 
@@ -13,51 +20,40 @@ namespace {
     struct Pending { bool down; int button; bool p1; int age; int max; };
 
     std::deque<Pending> g_queue;
-    bool   g_passthrough = false;
-    int    g_tick = 0;
-    int    g_lastPress[3] = {-100000, -100000, -100000};
-    bool   g_bufferOn = true;      // runtime toggle (on top of the "enabled" setting)
-    bool   g_freeze = false;
-    bool   g_step = false;
+    bool  g_passthrough = false;
+    int   g_tick = 0;
+    int   g_lastPress[3] = {-100000, -100000, -100000};
+    bool  g_bufferOn = true;
+    bool  g_freeze = false;
+    bool  g_step = false;
+    float g_lastScale = 1.f;
     Ref<CCLabelBMFont> g_overlay;
-    float  g_lastScale = 1.f;
+    Ref<CCMenu> g_menu;
+
+    // ---- simulation state ----
+    float g_dt = 0.f;          // dt of the last processCommands call
+    float g_scale = 1.f;       // calibrated: sim dt = g_dt * g_scale == one real tick of movement
+    bool  g_simOK = false;     // prediction usable (calibration succeeded)
+    bool  g_useField = false;  // read m_position instead of node position
+    bool  g_havePrev = false;
+    float g_prevX = 0.f;
+    int   g_calibCount = 0;
+    int   g_sinceCalib = 0;
 
     template <class T> T S(char const* k) { return Mod::get()->getSettingValue<T>(k); }
 
-    // ---- per-level profile: "normal,wave" stored as a string ----
-    std::string profileKey(PlayLayer* pl) {
-        return fmt::format("profile-{}", (int)pl->m_level->m_levelID.value());
-    }
-    bool loadProfile(PlayLayer* pl, int& normalT, int& waveT) {
-        auto key = profileKey(pl);
-        if (!Mod::get()->hasSavedValue(key)) return false;
-        auto v = Mod::get()->getSavedValue<std::string>(key);
-        if (v.empty()) return false;
-        return sscanf(v.c_str(), "%d,%d", &normalT, &waveT) == 2;
+    CCPoint ppos(PlayerObject* p) { return g_useField ? p->m_position : p->getPosition(); }
+
+    bool isGroundMode(PlayerObject* p) {
+        return !(p->m_isDart || p->m_isShip || p->m_isBird || p->m_isSwing);
     }
 
-    // Only ground-based modes need a press buffer. Ship, UFO, wave and swing can act any
-    // time, so delaying their presses would only add lag (wave uses the release buffer).
-    int pressTicksFor(PlayerObject* p, PlayLayer* pl) {
-        int normal = (int)S<int64_t>("normal-ticks");
-        int pn, pw;
-        if (pl && loadProfile(pl, pn, pw)) normal = pn;
-        if (p->m_isDart || p->m_isShip || p->m_isBird || p->m_isSwing) return 0;
-        char const* k = "cube-ticks";
-        if (p->m_isBall) k = "ball-ticks";
-        else if (p->m_isRobot) k = "robot-ticks";
-        else if (p->m_isSpider) k = "spider-ticks";
-        int v = (int)S<int64_t>(k);
-        return v < 0 ? normal : v;
-    }
-
-    int releaseTicksFor(PlayerObject* p, PlayLayer* pl) {
-        if (p->m_isDart) {
-            int w = (int)S<int64_t>("wave-release-ticks");
-            int pn, pw;
-            if (pl && loadProfile(pl, pn, pw)) w = pw;
-            return w;
+    int maxTicks(PlayerObject* p, bool down, bool predictive) {
+        if (down) {
+            if (isGroundMode(p)) return (int)S<int64_t>("ground-ticks");
+            return predictive ? (int)S<int64_t>("flight-ticks") : 0;
         }
+        if (p->m_isDart) return (int)S<int64_t>("wave-release-ticks");
         return (int)S<int64_t>("release-ticks");
     }
 
@@ -70,11 +66,110 @@ namespace {
     void showOverlay(std::string const& text) {
         if (!g_overlay || !S<bool>("overlay")) return;
         g_overlay->setString(text.c_str());
-        g_overlay->setScale(S<double>("overlay-scale"));
+        g_overlay->setScale((float)S<double>("overlay-scale"));
         g_overlay->stopAllActions();
         g_overlay->setOpacity(220);
         g_overlay->runAction(CCSequence::create(CCDelayTime::create(0.6f), CCFadeTo::create(0.4f, 0), nullptr));
     }
+
+    // ---------- prediction ----------
+    struct Hz { CCRect r; CCPoint c; float rad; };
+
+    std::vector<Hz> collectHazards(PlayLayer* pl, float px, float reach) {
+        std::vector<Hz> out;
+        auto arr = pl->m_objects;
+        if (!arr) return out;
+        for (unsigned i = 0, n = arr->count(); i < n; ++i) {
+            auto g = static_cast<GameObject*>(arr->objectAtIndex(i));
+            if (!g) continue;
+            if (g->m_objectType != GameObjectType::Hazard && g->m_objectType != GameObjectType::AnimatedHazard) continue;
+            if (g->m_isGroupDisabled) continue;
+            auto pos = g->getPosition();
+            if (pos.x < px - 60.f || pos.x > px + reach) continue;
+            Hz h;
+            h.r = g->getObjectRect();
+            h.c = pos;
+            h.rad = g->m_objectRadius;
+            out.push_back(h);
+        }
+        return out;
+    }
+
+    bool hitsHazard(CCPoint c, std::vector<Hz> const& hz) {
+        constexpr float hs = 8.f; // forgiving half-size of the player hitbox
+        CCRect pr(c.x - hs, c.y - hs, hs * 2, hs * 2);
+        for (auto const& h : hz) {
+            if (h.rad > 0.f) {
+                float dx = c.x - h.c.x, dy = c.y - h.c.y;
+                if (std::sqrt(dx * dx + dy * dy) < h.rad + hs) return true;
+            } else if (h.r.intersectsRect(pr)) return true;
+        }
+        return false;
+    }
+
+    PlayerCheckpoint* cpBuf() {
+        static Ref<PlayerCheckpoint> cp = PlayerCheckpoint::create();
+        return cp;
+    }
+
+    // Would registering this press/release RIGHT NOW get the player killed by a hazard
+    // within the lookahead window (assuming no further input)?
+    bool wouldDie(PlayLayer* pl, PlayerObject* p, bool pressNow) {
+        if (!g_simOK || !pl || !p || p->m_isDead) return false;
+        int look = (int)S<int64_t>("lookahead");
+        auto start = ppos(p);
+        auto hz = collectHazards(pl, start.x, 14.f * look + 80.f);
+        if (hz.empty()) return false;
+
+        auto cp = cpBuf();
+        p->saveToCheckpoint(cp);
+        bool wasHold = p->m_holdingButtons[1];
+        if (pressNow) p->pushButton(PlayerButton::Jump); else p->releaseButton(PlayerButton::Jump);
+
+        bool dead = false;
+        float sdt = g_dt * g_scale;
+        for (int t = 0; t < look; ++t) {
+            p->update(sdt);
+            if (hitsHazard(ppos(p), hz)) { dead = true; break; }
+        }
+        p->loadFromCheckpoint(cp);
+        p->m_holdingButtons[1] = wasHold;
+        return dead;
+    }
+
+    // Measure how far one real tick moves the player vs. one sim step, so predicted
+    // trajectories use the right time step. If the sim can't move the player we disable prediction.
+    void calibrate(PlayerObject* p, float observedDx) {
+        auto cp = cpBuf();
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            p->saveToCheckpoint(cp);
+            float x0 = ppos(p).x;
+            p->update(g_dt);
+            float d = ppos(p).x - x0;
+            p->loadFromCheckpoint(cp);
+            if (d > 0.0001f) {
+                float s = observedDx / d;
+                if (s > 0.02f && s < 50.f) {
+                    if (g_calibCount == 0) g_scale = s;
+                    else if (s < g_scale * 1.5f && s > g_scale / 1.5f) g_scale = g_scale * 0.7f + s * 0.3f;
+                    ++g_calibCount;
+                    g_simOK = true;
+                }
+                return;
+            }
+            if (attempt == 0) g_useField = !g_useField; // try the other position source
+        }
+        g_simOK = false;
+    }
+
+    bool canFireNow(PlayLayer* pl, PlayerObject* p, Pending const& pd, bool predictive) {
+        if (pd.down) {
+            if (isGroundMode(p) && !p->m_isOnGround) return false;
+            return predictive ? !wouldDie(pl, p, true) : true;
+        }
+        return predictive ? !wouldDie(pl, p, false) : false;
+    }
+
 }
 
 class $modify(BufGJBase, GJBaseGameLayer) {
@@ -86,6 +181,7 @@ class $modify(BufGJBase, GJBaseGameLayer) {
         }
         auto* player = isPlayer1 ? m_player1 : m_player2;
         if (!player) { GJBaseGameLayer::handleButton(down, button, isPlayer1); return; }
+        bool predictive = S<bool>("predictive") && g_simOK;
 
         if (down) {
             // a new press must not be cancelled by an older delayed release: flush those first
@@ -98,50 +194,56 @@ class $modify(BufGJBase, GJBaseGameLayer) {
                 } else ++it;
             }
             g_lastPress[0] = g_lastPress[1]; g_lastPress[1] = g_lastPress[2]; g_lastPress[2] = g_tick;
-            int maxT = pressTicksFor(player, pl);
-            // already able to act, buffer disabled for this mode, or spamming -> straight through
-            if (maxT <= 0 || player->m_isOnGround || isSpam()) {
-                GJBaseGameLayer::handleButton(down, button, isPlayer1);
-                return;
+        } else {
+            // release while its press is still queued: send the press first so the tap isn't lost
+            for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
+                if (it->down && it->p1 == isPlayer1) {
+                    auto pr = *it; g_queue.erase(it);
+                    g_passthrough = true;
+                    GJBaseGameLayer::handleButton(true, pr.button, pr.p1);
+                    g_passthrough = false;
+                    showOverlay(fmt::format("P{} press +{}t", pr.p1 ? 1 : 2, pr.age));
+                    break;
+                }
             }
-            g_queue.push_back({true, button, isPlayer1, 0, maxT});
-            return;
         }
 
-        // release: if its press is still queued, fire the press first so the tap isn't lost
-        for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
-            if (it->down && it->p1 == isPlayer1) {
-                auto pr = *it; g_queue.erase(it);
-                g_passthrough = true;
-                GJBaseGameLayer::handleButton(true, pr.button, pr.p1);
-                g_passthrough = false;
-                showOverlay(fmt::format("P{} press +{}t", pr.p1 ? 1 : 2, pr.age));
-                break;
-            }
-        }
-        int rT = releaseTicksFor(player, pl);
-        if (rT <= 0 || isSpam()) {
+        int maxT = maxTicks(player, down, predictive);
+        Pending pd{down, button, isPlayer1, 0, maxT};
+        if (maxT <= 0 || isSpam() || canFireNow(pl, player, pd, predictive)) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
-        g_queue.push_back({false, button, isPlayer1, 0, rT});
+        g_queue.push_back(pd);
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         ++g_tick;
+        g_dt = dt;
         auto pl = PlayLayer::get();
+        if (pl && m_player1 && !m_player1->m_isDead) {
+            float x = ppos(m_player1).x;
+            if (g_havePrev && x > g_prevX && g_queue.empty() && S<bool>("predictive")) {
+                if (g_calibCount < 6 || ++g_sinceCalib >= 240) {
+                    g_sinceCalib = 0;
+                    calibrate(m_player1, x - g_prevX);
+                }
+            }
+            g_prevX = x; g_havePrev = true;
+        }
+
         if (pl && !g_queue.empty()) {
+            bool predictive = S<bool>("predictive") && g_simOK;
             for (auto it = g_queue.begin(); it != g_queue.end();) {
                 auto* player = it->p1 ? m_player1 : m_player2;
                 ++it->age;
-                bool fire = it->age >= it->max;
-                if (it->down && player && player->m_isOnGround) fire = true;
-                if (fire) {
+                bool go = !player || it->age >= it->max || canFireNow(pl, player, *it, predictive);
+                if (go) {
                     auto pr = *it; it = g_queue.erase(it);
                     g_passthrough = true;
                     GJBaseGameLayer::handleButton(pr.down, pr.button, pr.p1);
                     g_passthrough = false;
-                    showOverlay(fmt::format("P{} {} +{}t", pr.p1 ? 1 : 2, pr.down ? "press" : "release", pr.age));
+                    if (pr.age > 0) showOverlay(fmt::format("P{} {} +{}t", pr.p1 ? 1 : 2, pr.down ? "press" : "release", pr.age));
                 } else ++it;
             }
         }
@@ -149,10 +251,131 @@ class $modify(BufGJBase, GJBaseGameLayer) {
     }
 };
 
+// ---------------------------------------------------------------- settings GUI
+namespace {
+    struct TRow { char const* key; char const* label; };
+    struct SRow { char const* key; char const* label; double mn, mx, step; bool isFloat; };
+
+    constexpr TRow kToggles[] = {
+        {"enabled", "Buffer enabled"},
+        {"predictive", "Predictive mode"},
+        {"spam-guard", "Spam guard"},
+        {"overlay", "Input overlay"},
+        {"practice-buttons", "Practice buttons"},
+        {"noclip", "Noclip (practice)"},
+    };
+    constexpr SRow kSteppers[] = {
+        {"ground-ticks", "Ground ticks", 0, 40, 1, false},
+        {"flight-ticks", "Flight ticks", 0, 40, 1, false},
+        {"wave-release-ticks", "Wave release", 0, 40, 1, false},
+        {"release-ticks", "Release ticks", 0, 40, 1, false},
+        {"lookahead", "Lookahead", 4, 60, 2, false},
+        {"game-speed", "Game speed", 0.1, 2.0, 0.1, true},
+    };
+
+    std::string fmtVal(SRow const& r) {
+        if (r.isFloat) return fmt::format("{:.1f}x", S<double>(r.key));
+        return fmt::format("{}", S<int64_t>(r.key));
+    }
+}
+
+class BufferPopup : public geode::Popup {
+protected:
+    std::map<std::string, CCLabelBMFont*> m_vals;
+
+    bool init() {
+        if (!Popup::init(390.f, 255.f)) return false;
+        this->setTitle("Predictive Buffer");
+        float top = 190.f;
+
+        for (int i = 0; i < (int)std::size(kToggles); ++i) {
+            auto& r = kToggles[i];
+            float y = top - i * 30.f;
+            auto t = CCMenuItemToggler::createWithStandardSprites(this, menu_selector(BufferPopup::onToggle), .55f);
+            t->setID(r.key);
+            t->toggle(S<bool>(r.key));
+            t->setPosition({28.f, y});
+            m_buttonMenu->addChild(t);
+            auto l = CCLabelBMFont::create(r.label, "bigFont.fnt");
+            l->setScale(.42f);
+            l->setAnchorPoint({0.f, .5f});
+            l->setPosition({46.f, y});
+            m_mainLayer->addChild(l);
+        }
+
+        for (int i = 0; i < (int)std::size(kSteppers); ++i) {
+            auto& r = kSteppers[i];
+            float y = top - i * 30.f;
+            auto l = CCLabelBMFont::create(r.label, "bigFont.fnt");
+            l->setScale(.36f);
+            l->setAnchorPoint({0.f, .5f});
+            l->setPosition({185.f, y});
+            m_mainLayer->addChild(l);
+
+            auto mk = [&](char const* txt, int dir, float x) {
+                auto spr = ButtonSprite::create(txt, 20, true, "bigFont.fnt", "GJ_button_04.png", 20.f, .55f);
+                auto b = CCMenuItemSpriteExtra::create(spr, this, menu_selector(BufferPopup::onStep));
+                b->setID(r.key);
+                b->setTag(dir);
+                b->setPosition({x, y});
+                m_buttonMenu->addChild(b);
+            };
+            mk("-", -1, 297.f);
+            mk("+", 1, 366.f);
+
+            auto v = CCLabelBMFont::create(fmtVal(r).c_str(), "goldFont.fnt");
+            v->setScale(.5f);
+            v->setPosition({331.f, y});
+            m_mainLayer->addChild(v);
+            m_vals[r.key] = v;
+        }
+
+        auto hint = CCLabelBMFont::create("Tick = 1/4 frame at 60 fps. Predictive holds a click only if it would hit a hazard.", "chatFont.fnt");
+        hint->setScale(.5f);
+        hint->setOpacity(160);
+        hint->setPosition({195.f, 22.f});
+        m_mainLayer->addChild(hint);
+        return true;
+    }
+
+    void onToggle(CCObject* s) {
+        auto t = static_cast<CCMenuItemToggler*>(s);
+        Mod::get()->setSettingValue<bool>(t->getID(), !t->isToggled());
+    }
+
+    void onStep(CCObject* s) {
+        auto n = static_cast<CCNode*>(s);
+        std::string key = n->getID();
+        int dir = n->getTag();
+        for (auto& r : kSteppers) {
+            if (key != r.key) continue;
+            if (r.isFloat) {
+                double v = std::round((S<double>(r.key) + dir * r.step) * 10.0) / 10.0;
+                v = std::clamp(v, r.mn, r.mx);
+                Mod::get()->setSettingValue<double>(r.key, v);
+            } else {
+                int64_t v = S<int64_t>(r.key) + (int64_t)(dir * r.step);
+                v = std::clamp<int64_t>(v, (int64_t)r.mn, (int64_t)r.mx);
+                Mod::get()->setSettingValue<int64_t>(r.key, v);
+            }
+            m_vals[key]->setString(fmtVal(r).c_str());
+        }
+    }
+
+public:
+    static BufferPopup* create() {
+        auto ret = new BufferPopup();
+        if (ret->init()) { ret->autorelease(); return ret; }
+        delete ret;
+        return nullptr;
+    }
+};
+
+// ---------------------------------------------------------------- play layer
 class $modify(BufPlay, PlayLayer) {
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
-        g_queue.clear(); g_freeze = false; g_step = false;
+        g_queue.clear(); g_freeze = false; g_step = false; g_havePrev = false;
 
         auto win = CCDirector::get()->getWinSize();
         auto lbl = CCLabelBMFont::create("", "bigFont.fnt");
@@ -162,23 +385,23 @@ class $modify(BufPlay, PlayLayer) {
         this->addChild(lbl);
         g_overlay = lbl;
 
-        if (S<bool>("practice-buttons")) {
-            auto menu = CCMenu::create();
-            menu->setPosition({0, 0});
-            menu->setZOrder(100);
-            auto mk = [&](char const* txt, SEL_MenuHandler cb, CCPoint pos) {
-                auto spr = ButtonSprite::create(txt, 30, true, "bigFont.fnt", "GJ_button_04.png", 30.f, .6f);
-                spr->setOpacity(150);
-                auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-                btn->setPosition(pos);
-                menu->addChild(btn);
-            };
-            mk("Buf", menu_selector(BufPlay::onToggleBuf), {30, win.height / 2 + 60});
-            mk("||",  menu_selector(BufPlay::onFreeze),   {30, win.height / 2 + 20});
-            mk(">|",  menu_selector(BufPlay::onStep),     {30, win.height / 2 - 20});
-            mk("CP",  menu_selector(BufPlay::onCheckpoint), {30, win.height / 2 - 60});
-            this->addChild(menu);
-        }
+        auto menu = CCMenu::create();
+        menu->setPosition({0, 0});
+        menu->setZOrder(100);
+        auto mk = [&](char const* txt, SEL_MenuHandler cb, CCPoint pos) {
+            auto spr = ButtonSprite::create(txt, 30, true, "bigFont.fnt", "GJ_button_04.png", 30.f, .6f);
+            spr->setOpacity(150);
+            auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
+            btn->setPosition(pos);
+            menu->addChild(btn);
+        };
+        mk("Buf", menu_selector(BufPlay::onToggleBuf), {30, win.height / 2 + 60});
+        mk("||",  menu_selector(BufPlay::onFreeze),   {30, win.height / 2 + 20});
+        mk(">|",  menu_selector(BufPlay::onStep),     {30, win.height / 2 - 20});
+        mk("CP",  menu_selector(BufPlay::onCheckpoint), {30, win.height / 2 - 60});
+        menu->setVisible(false);
+        this->addChild(menu);
+        g_menu = menu;
     }
 
     void onToggleBuf(CCObject*) {
@@ -201,9 +424,17 @@ class $modify(BufPlay, PlayLayer) {
         showOverlay("Checkpoint");
     }
 
+    void pauseGame(bool unfocused) {
+        if (g_menu) g_menu->setVisible(false);
+        PlayLayer::pauseGame(unfocused);
+    }
+
     void update(float dt) {
+        // practice buttons only exist on screen while playing in practice mode (never while paused)
+        if (g_menu) g_menu->setVisible(m_isPracticeMode && S<bool>("practice-buttons"));
+
         auto sched = CCDirector::get()->getScheduler();
-        float want = (m_isPracticeMode) ? (float)S<double>("game-speed") : 1.f;
+        float want = m_isPracticeMode ? (float)S<double>("game-speed") : 1.f;
         if (want != g_lastScale) { sched->setTimeScale(want); g_lastScale = want; }
 
         if (m_isPracticeMode && g_freeze) {
@@ -222,55 +453,36 @@ class $modify(BufPlay, PlayLayer) {
 
     void resetLevel() {
         g_queue.clear();
+        g_havePrev = false;
         PlayLayer::resetLevel();
     }
 
     void onQuit() {
         CCDirector::get()->getScheduler()->setTimeScale(1.f);
         g_lastScale = 1.f; g_freeze = false; g_step = false;
-        g_queue.clear(); g_overlay = nullptr;
+        g_queue.clear(); g_overlay = nullptr; g_menu = nullptr;
+        g_havePrev = false; g_simOK = false; g_calibCount = 0;
         PlayLayer::onQuit();
     }
 };
 
-// Pause menu: Buffer button -> per-level profile save/clear
+// ---------------------------------------------------------------- pause menu button
 class $modify(BufPause, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
         auto win = CCDirector::get()->getWinSize();
-        std::string c = S<std::string>("button-corner");
-        float x = (c.find("der.") != std::string::npos) ? win.width - 40 : 40;
-        float y = (c.rfind("Abajo", 0) == 0) ? 40 : win.height - 40;
-        auto spr = ButtonSprite::create("Buffer", 60, true, "bigFont.fnt", "GJ_button_04.png", 30.f, .6f);
+        auto spr = ButtonSprite::create("Buffer", 90, true, "goldFont.fnt", "GJ_button_01.png", 45.f, .9f);
         spr->setScale((float)S<double>("button-scale"));
         auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(BufPause::onBuffer));
         auto menu = CCMenu::create();
-        menu->setPosition({x, y});
-        menu->addChild(btn);
+        menu->setPosition({win.width - 70.f, win.height / 2.f});
+        menu->setZOrder(100);
         btn->setPosition({0, 0});
+        menu->addChild(btn);
         this->addChild(menu);
     }
 
     void onBuffer(CCObject*) {
-        auto pl = PlayLayer::get();
-        if (!pl) return;
-        int n = (int)S<int64_t>("normal-ticks"), w = (int)S<int64_t>("wave-release-ticks");
-        int pn, pw;
-        bool has = loadProfile(pl, pn, pw);
-        auto msg = fmt::format(
-            "Global: normal <cy>{}</c>t, wave <cy>{}</c>t.\nThis level profile: {}.\n\n"
-            "<cg>Save</c> stores the global values for this level. <cr>Clear</c> removes it.\n"
-            "(Change global values in the mod settings, then Save.)",
-            n, w, has ? fmt::format("normal {}t, wave-release {}t", pn, pw) : "none");
-        createQuickPopup("Buffer", msg, "Clear", "Save",
-            [pl](auto, bool save) {
-                auto key = profileKey(pl);
-                if (save) {
-                    Mod::get()->setSavedValue<std::string>(key, fmt::format("{},{}",
-                        (int)S<int64_t>("normal-ticks"), (int)S<int64_t>("wave-release-ticks")));
-                } else {
-                    Mod::get()->setSavedValue<std::string>(key, "");
-                }
-            });
+        if (auto p = BufferPopup::create()) p->show();
     }
 };
